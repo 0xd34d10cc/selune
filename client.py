@@ -15,7 +15,6 @@ async def main(uri):
 
         response = await send_request(ws, {
             'type': 'add_stream',
-            'username': '0xd34d10cc',
             'stream': {
                 'address': 'rtp://127.0.0.1:1337',
                 'description': 'A stupid stream'
@@ -23,13 +22,14 @@ async def main(uri):
         })
 
         print('add_stream status: ', response)
+        stream_id = response['stream_id']
 
         response = await send_request(ws, {'type': 'get_streams'})
         print('streams: ', response)
 
         response = await send_request(ws, {
             'type': 'remove_stream',
-            'username': '0xd34d10cc'
+            'stream_id': stream_id
         })
         print('remove_steram status: ', response)
 
