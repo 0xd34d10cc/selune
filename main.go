@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -31,6 +32,12 @@ type Server struct {
 	streams  *mongo.Collection
 }
 
+type Client struct {
+	conn   *websocket.Conn
+	server *Server
+	log    func(string, ...interface{})
+}
+
 type Request struct {
 	Type     string   `json:"type"`
 	StreamID StreamID `json:"stream_id,omitempty"`
@@ -41,13 +48,6 @@ type Response struct {
 	Status   string   `json:"status"`
 	Message  string   `json:"message,omitempty"`
 	StreamID StreamID `json:"stream_id,omitempty"`
-}
-
-func failure(message string) Response {
-	return Response{
-		Status:  "fail",
-		Message: message,
-	}
 }
 
 func NewServer(addr string, dbUri string) (*Server, error) {
@@ -68,6 +68,20 @@ func NewServer(addr string, dbUri string) (*Server, error) {
 		dbClient: dbClient,
 		streams:  streams,
 	}, nil
+}
+
+func (server *Server) Accept(conn *websocket.Conn) Client {
+	addr := conn.RemoteAddr().String()
+	return Client{
+		conn:   conn,
+		server: server,
+		log: func(f string, args ...interface{}) {
+			if len(args) != 0 {
+				f = fmt.Sprintf(f, args...)
+			}
+			log.Printf("[%v] %v", addr, f)
+		},
+	}
 }
 
 func (server *Server) Streams() (map[StreamID]Stream, error) {
@@ -92,6 +106,10 @@ func (server *Server) Streams() (map[StreamID]Stream, error) {
 			Address:     stream["address"].(string),
 			Description: stream["description"].(string),
 		}
+	}
+
+	if cur.Err() != nil {
+		return nil, cur.Err()
 	}
 
 	return streams, nil
@@ -133,101 +151,6 @@ func (server *Server) RemoveStream(id StreamID) error {
 	return nil
 }
 
-func (server *Server) processRequest(c *websocket.Conn, request Request) error {
-	sendResponse := func(response interface{}) error {
-		data, err := json.Marshal(&response)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		return c.WriteMessage(websocket.BinaryMessage, data)
-	}
-
-	switch request.Type {
-	case "get_streams":
-		streams, err := server.Streams()
-		if err != nil {
-			log.Println("Failed to query list of active streams:", err)
-			return sendResponse(failure("Failed to query streams"))
-		}
-
-		return sendResponse(streams)
-	case "add_stream":
-		if request.Stream == nil {
-			response := failure("No stream provided for add_stream request")
-			return sendResponse(response)
-		}
-
-		id, err := server.AddStream(*request.Stream)
-		if err != nil {
-			return sendResponse(failure(err.Error()))
-		}
-
-		return sendResponse(Response{
-			Status:   "success",
-			StreamID: id,
-		})
-	case "remove_stream":
-		if request.StreamID == "" {
-			resposne := failure("No stream id provided for remove_stream request")
-			return sendResponse(resposne)
-		}
-
-		err := server.RemoveStream(request.StreamID)
-		if err != nil {
-			return sendResponse(failure(err.Error()))
-		}
-		return sendResponse(Response{Status: "success"})
-	default:
-		return sendResponse(failure("Invalid request type"))
-	}
-}
-
-func (server *Server) processConnection(c *websocket.Conn) {
-	defer c.Close()
-	log.Println("Received a new connection from:", c.RemoteAddr())
-
-	for {
-		mt, message, err := c.ReadMessage()
-
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				log.Printf("Connection %v has been successfully closed by user", c.RemoteAddr())
-				return
-			}
-
-			log.Println("Failed to read message:", err)
-			return
-		}
-
-		switch mt {
-		case websocket.TextMessage:
-			log.Println("Received unexpected text message")
-			return
-		case websocket.BinaryMessage:
-			request := Request{}
-			err = json.Unmarshal(message, &request)
-			if err != nil {
-				log.Println("Invalid message received:", err)
-				return
-			}
-
-			err := server.processRequest(c, request)
-			if err != nil {
-				log.Println("Failed to process request:", err)
-				return
-			}
-		case websocket.CloseMessage:
-			log.Println("Connection successfully closed")
-			return
-		case websocket.PingMessage:
-			c.WriteMessage(websocket.PongMessage, message)
-		case websocket.PongMessage:
-			// ignore
-		}
-	}
-}
-
 func (server *Server) Run() error {
 	upgrader := websocket.Upgrader{}
 	http.HandleFunc("/streams", func(rw http.ResponseWriter, r *http.Request) {
@@ -236,14 +159,116 @@ func (server *Server) Run() error {
 			log.Println("Upgrade error: ", err)
 			return
 		}
-
-		server.processConnection(c)
+		defer c.Close()
+		client := server.Accept(c)
+		client.Run()
 	})
 
 	log.Println("Listening on", server.addr)
 
 	// TODO: TLS
 	return http.ListenAndServe(server.addr, nil)
+}
+
+func (c *Client) Run() {
+	c.log("New connection")
+
+	for {
+		mt, message, err := c.conn.ReadMessage()
+
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				c.log("Connection closed by user")
+				return
+			}
+
+			c.log("Failed to read message: %v", err)
+			return
+		}
+
+		switch mt {
+		case websocket.TextMessage:
+			c.log("Received unexpected text message")
+			return
+		case websocket.BinaryMessage:
+			request := Request{}
+			err = json.Unmarshal(message, &request)
+			if err != nil {
+				c.log("Invalid message received: %v", err)
+				return
+			}
+
+			err := c.processRequest(request)
+			if err != nil {
+				c.log("Failed to process request: %v", err)
+				return
+			}
+		case websocket.CloseMessage:
+			c.log("Received connection close")
+			return
+		case websocket.PingMessage:
+			c.conn.WriteMessage(websocket.PongMessage, message)
+		case websocket.PongMessage:
+			// ignore
+		}
+	}
+
+}
+
+func (c *Client) sendFail(message string) error {
+	return c.sendResponse(Response{
+		Status:  "fail",
+		Message: message,
+	})
+}
+
+func (c *Client) sendResponse(response interface{}) error {
+	data, err := json.Marshal(&response)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return c.conn.WriteMessage(websocket.BinaryMessage, data)
+}
+
+func (c *Client) processRequest(request Request) error {
+	c.log("Received \"%v\" request", request.Type)
+	switch request.Type {
+	case "get_streams":
+		streams, err := c.server.Streams()
+		if err != nil {
+			c.log("Failed to query list of active streams: %v", err)
+			return c.sendFail("Failed to query streams")
+		}
+
+		return c.sendResponse(streams)
+	case "add_stream":
+		if request.Stream == nil {
+			return c.sendFail("No stream provided for add_stream request")
+		}
+
+		id, err := c.server.AddStream(*request.Stream)
+		if err != nil {
+			return c.sendFail(err.Error())
+		}
+
+		return c.sendResponse(Response{
+			Status:   "success",
+			StreamID: id,
+		})
+	case "remove_stream":
+		if request.StreamID == "" {
+			return c.sendFail("No stream id provided for remove_stream request")
+		}
+
+		err := c.server.RemoveStream(request.StreamID)
+		if err != nil {
+			return c.sendFail(err.Error())
+		}
+		return c.sendResponse(Response{Status: "success"})
+	default:
+		return c.sendFail("Invalid request type")
+	}
 }
 
 func main() {
