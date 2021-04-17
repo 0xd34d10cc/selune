@@ -35,7 +35,6 @@ type Server struct {
 type Client struct {
 	conn   *websocket.Conn
 	server *Server
-	log    func(string, ...interface{})
 }
 
 type Request struct {
@@ -71,16 +70,9 @@ func NewServer(addr string, dbUri string) (*Server, error) {
 }
 
 func (server *Server) Accept(conn *websocket.Conn) Client {
-	addr := conn.RemoteAddr().String()
 	return Client{
 		conn:   conn,
 		server: server,
-		log: func(f string, args ...interface{}) {
-			if len(args) != 0 {
-				f = fmt.Sprintf(f, args...)
-			}
-			log.Printf("[%v] %v", addr, f)
-		},
 	}
 }
 
@@ -171,40 +163,40 @@ func (server *Server) Run() error {
 }
 
 func (c *Client) Run() {
-	c.log("New connection")
+	c.Log("New connection")
 
 	for {
 		mt, message, err := c.conn.ReadMessage()
 
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				c.log("Connection closed by user")
+				c.Log("Connection closed by user")
 				return
 			}
 
-			c.log("Failed to read message: %v", err)
+			c.Log("Failed to read message: %v", err)
 			return
 		}
 
 		switch mt {
 		case websocket.TextMessage:
-			c.log("Received unexpected text message")
+			c.Log("Received unexpected text message")
 			return
 		case websocket.BinaryMessage:
 			request := Request{}
 			err = json.Unmarshal(message, &request)
 			if err != nil {
-				c.log("Invalid message received: %v", err)
+				c.Log("Invalid message received: %v", err)
 				return
 			}
 
 			err := c.processRequest(request)
 			if err != nil {
-				c.log("Failed to process request: %v", err)
+				c.Log("Failed to process request: %v", err)
 				return
 			}
 		case websocket.CloseMessage:
-			c.log("Received connection close")
+			c.Log("Received connection close")
 			return
 		case websocket.PingMessage:
 			c.conn.WriteMessage(websocket.PongMessage, message)
@@ -213,6 +205,14 @@ func (c *Client) Run() {
 		}
 	}
 
+}
+
+func (c *Client) Log(f string, args ...interface{}) {
+	addr := c.conn.RemoteAddr()
+	if len(args) != 0 {
+		f = fmt.Sprintf(f, args...)
+	}
+	log.Printf("[%v] %v", addr, f)
 }
 
 func (c *Client) sendFail(message string) error {
@@ -232,12 +232,12 @@ func (c *Client) sendResponse(response interface{}) error {
 }
 
 func (c *Client) processRequest(request Request) error {
-	c.log("Received \"%v\" request", request.Type)
+	c.Log("Received \"%v\" request", request.Type)
 	switch request.Type {
 	case "get_streams":
 		streams, err := c.server.Streams()
 		if err != nil {
-			c.log("Failed to query list of active streams: %v", err)
+			c.Log("Failed to query list of active streams: %v", err)
 			return c.sendFail("Failed to query streams")
 		}
 
@@ -292,5 +292,4 @@ func main() {
 	}
 
 	log.Fatal(server.Run())
-
 }
