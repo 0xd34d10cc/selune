@@ -5,9 +5,9 @@ import websockets
 
 async def send_request(ws, request):
     print('client out:', json.dumps(request, indent=4))
-    await ws.send(json.dumps(request).encode('utf-8'))
+    await ws.send(json.dumps(request))
     response = await ws.recv()
-    response = json.loads(response.decode('utf-8'))
+    response = json.loads(response)
     print('client in:', json.dumps(response, indent=4))
     return response
 

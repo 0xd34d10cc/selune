@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,9 +45,10 @@ type Request struct {
 }
 
 type Response struct {
-	Status   string   `json:"status"`
-	Message  string   `json:"message,omitempty"`
-	StreamID StreamID `json:"stream_id,omitempty"`
+	Status   string              `json:"status"`
+	Message  string              `json:"message,omitempty"`
+	StreamID StreamID            `json:"stream_id,omitempty"`
+	Streams  map[StreamID]Stream `json:"streams,omitempty"`
 }
 
 func NewServer(addr string, dbUri string) (*Server, error) {
@@ -165,8 +167,11 @@ func (server *Server) Run() error {
 func (c *Client) Run() {
 	c.Log("New connection")
 
+	reader := bytes.NewReader([]byte{})
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
 	for {
-		mt, message, err := c.conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
@@ -178,33 +183,25 @@ func (c *Client) Run() {
 			return
 		}
 
-		switch mt {
-		case websocket.TextMessage:
-			c.Log("Received unexpected text message")
+		reader.Reset(message)
+		request := Request{}
+		err = decoder.Decode(&request)
+		if err != nil {
+			c.Log("Invalid message received: %v", err)
 			return
-		case websocket.BinaryMessage:
-			request := Request{}
-			err = json.Unmarshal(message, &request)
-			if err != nil {
-				c.Log("Invalid message received: %v", err)
-				return
-			}
+		}
 
-			err := c.processRequest(request)
-			if err != nil {
-				c.Log("Failed to process request: %v", err)
-				return
-			}
-		case websocket.CloseMessage:
-			c.Log("Received connection close")
+		if decoder.More() {
+			c.Log("Incomplete parse")
 			return
-		case websocket.PingMessage:
-			c.conn.WriteMessage(websocket.PongMessage, message)
-		case websocket.PongMessage:
-			// ignore
+		}
+
+		err = c.processRequest(request)
+		if err != nil {
+			c.Log("Failed to process request: %v", err)
+			return
 		}
 	}
-
 }
 
 func (c *Client) Log(f string, args ...interface{}) {
@@ -215,14 +212,18 @@ func (c *Client) Log(f string, args ...interface{}) {
 	log.Printf("[%v] %v", addr, f)
 }
 
-func (c *Client) sendFail(message string) error {
+func (c *Client) sendFail(message string, args ...interface{}) error {
+	if len(args) != 0 {
+		message = fmt.Sprintf(message, args...)
+	}
+
 	return c.sendResponse(Response{
 		Status:  "fail",
 		Message: message,
 	})
 }
 
-func (c *Client) sendResponse(response interface{}) error {
+func (c *Client) sendResponse(response Response) error {
 	data, err := json.Marshal(&response)
 	if err != nil {
 		log.Fatal(err)
@@ -241,7 +242,10 @@ func (c *Client) processRequest(request Request) error {
 			return c.sendFail("Failed to query streams")
 		}
 
-		return c.sendResponse(streams)
+		return c.sendResponse(Response{
+			Status:  "success",
+			Streams: streams,
+		})
 	case "add_stream":
 		if request.Stream == nil {
 			return c.sendFail("No stream provided for add_stream request")
@@ -249,7 +253,7 @@ func (c *Client) processRequest(request Request) error {
 
 		id, err := c.server.AddStream(*request.Stream)
 		if err != nil {
-			return c.sendFail(err.Error())
+			return c.sendFail("Failed to add stream: %v", err.Error())
 		}
 
 		return c.sendResponse(Response{
@@ -263,7 +267,7 @@ func (c *Client) processRequest(request Request) error {
 
 		err := c.server.RemoveStream(request.StreamID)
 		if err != nil {
-			return c.sendFail(err.Error())
+			return c.sendFail("Failed to remove stream: %v", err.Error())
 		}
 		return c.sendResponse(Response{Status: "success"})
 	default:
@@ -291,5 +295,8 @@ func main() {
 		log.Fatal("Failed to create server instance:", err)
 	}
 
-	log.Fatal(server.Run())
+	err = server.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
 }
