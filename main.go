@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
@@ -22,36 +23,46 @@ import (
 
 type StreamID = string
 
+type Server struct {
+	mux      *http.ServeMux
+	dbClient *mongo.Client
+	streams  *mongo.Collection
+
+	m         sync.Mutex
+	streamers map[StreamID]chan Response
+}
+
+type Session struct {
+	conn    *websocket.Conn
+	server  *Server
+	streams map[StreamID]struct{}
+
+	messages      chan Request
+	notifications chan Response
+	errors        chan error
+}
+
 type Stream struct {
 	Address     string `json:"address"`
 	Description string `json:"description"`
 }
 
-type Server struct {
-	addr     string
-	dbClient *mongo.Client
-	streams  *mongo.Collection
-}
-
-type Client struct {
-	conn   *websocket.Conn
-	server *Server
-}
-
 type Request struct {
-	Type     string   `json:"type"`
-	StreamID StreamID `json:"stream_id,omitempty"`
-	Stream   *Stream  `json:"stream,omitempty"`
+	Type        string   `json:"type"`
+	StreamID    StreamID `json:"stream_id,omitempty"`
+	Stream      *Stream  `json:"stream,omitempty"`
+	Destination string   `json:"destination,omitempty"`
 }
 
 type Response struct {
-	Status   string              `json:"status"`
-	Message  string              `json:"message,omitempty"`
-	StreamID StreamID            `json:"stream_id,omitempty"`
-	Streams  map[StreamID]Stream `json:"streams,omitempty"`
+	Status      string              `json:"status"`
+	Message     string              `json:"message,omitempty"`
+	StreamID    StreamID            `json:"stream_id,omitempty"`
+	Streams     map[StreamID]Stream `json:"streams,omitempty"`
+	Destination string              `json:"destination,omitempty"`
 }
 
-func NewServer(addr string, dbUri string) (*Server, error) {
+func NewServer(path string, dbUri string) (*Server, error) {
 	dbClient, err := mongo.Connect(context.Background(), options.Client().ApplyURI(dbUri))
 	if err != nil {
 		return nil, err
@@ -64,17 +75,42 @@ func NewServer(addr string, dbUri string) (*Server, error) {
 
 	log.Println("Successfully connected to", dbUri)
 	streams := dbClient.Database("selune").Collection("streams")
-	return &Server{
-		addr:     addr,
+
+	server := &Server{
+		mux:      nil,
 		dbClient: dbClient,
 		streams:  streams,
-	}, nil
+
+		m:         sync.Mutex{},
+		streamers: make(map[StreamID]chan Response),
+	}
+
+	mux := http.NewServeMux()
+	upgrader := websocket.Upgrader{}
+	mux.HandleFunc(path, func(rw http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(rw, r, nil)
+		if err != nil {
+			log.Printf("[%v] Failed to upgrade to websocket: %v", r.RemoteAddr, err)
+			return
+		}
+		session := server.Accept(c)
+		defer session.Close()
+		session.Run()
+	})
+
+	server.mux = mux
+	return server, nil
 }
 
-func (server *Server) Accept(conn *websocket.Conn) Client {
-	return Client{
-		conn:   conn,
-		server: server,
+func (server *Server) Accept(conn *websocket.Conn) Session {
+	return Session{
+		conn:    conn,
+		server:  server,
+		streams: make(map[StreamID]struct{}),
+
+		messages:      make(chan Request),
+		notifications: make(chan Response),
+		errors:        make(chan error),
 	}
 }
 
@@ -109,7 +145,7 @@ func (server *Server) Streams() (map[StreamID]Stream, error) {
 	return streams, nil
 }
 
-func (server *Server) AddStream(stream Stream) (StreamID, error) {
+func (server *Server) AddStream(stream Stream, notifications chan Response) (StreamID, error) {
 	if _, err := url.Parse(stream.Address); err != nil {
 		return "", errors.New("Invalid stream address")
 	}
@@ -122,7 +158,12 @@ func (server *Server) AddStream(stream Stream) (StreamID, error) {
 		return "", err
 	}
 
-	return StreamID(res.InsertedID.(primitive.ObjectID).Hex()), nil
+	id := StreamID(res.InsertedID.(primitive.ObjectID).Hex())
+
+	server.m.Lock()
+	server.streamers[id] = notifications
+	server.m.Unlock()
+	return id, nil
 }
 
 func (server *Server) RemoveStream(id StreamID) error {
@@ -130,6 +171,10 @@ func (server *Server) RemoveStream(id StreamID) error {
 	if err != nil {
 		return err
 	}
+
+	server.m.Lock()
+	delete(server.streamers, id)
+	server.m.Unlock()
 
 	res, err := server.streams.DeleteOne(context.Background(), bson.M{
 		"_id": objectID,
@@ -145,41 +190,53 @@ func (server *Server) RemoveStream(id StreamID) error {
 	return nil
 }
 
-func (server *Server) Run() error {
-	upgrader := websocket.Upgrader{}
-	http.HandleFunc("/streams", func(rw http.ResponseWriter, r *http.Request) {
-		c, err := upgrader.Upgrade(rw, r, nil)
-		if err != nil {
-			log.Printf("[%v] Failed to upgrade to websocket: %v", r.RemoteAddr, err)
-			return
-		}
-		defer c.Close()
-		client := server.Accept(c)
-		client.Run()
-	})
+func (server *Server) NotifyStreamer(id StreamID, destination string) error {
+	if _, err := primitive.ObjectIDFromHex(id); err != nil {
+		return err
+	}
 
-	log.Println("Listening on", server.addr)
+	if _, err := url.Parse(destination); err != nil {
+		return err
+	}
 
-	// TODO: TLS
-	return http.ListenAndServe(server.addr, nil)
+	server.m.Lock()
+	notifications, ok := server.streamers[id]
+	server.m.Unlock()
+
+	if !ok {
+		return errors.New("No such stream")
+	}
+
+	notifications <- Response{
+		Status:      "new_viewer",
+		StreamID:    id,
+		Destination: destination,
+	}
+
+	return nil
 }
 
-func (c *Client) Run() {
-	c.Log("New connection")
+func (server *Server) Run(addr string) error {
+	log.Println("Listening on", addr)
+	// TODO: TLS
+	return http.ListenAndServe(addr, server.mux)
+}
 
+func (session *Session) readMessages() {
 	reader := bytes.NewReader([]byte{})
 	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
+
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, message, err := session.conn.ReadMessage()
 
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				c.Log("Connection closed by user")
+				session.errors <- nil
 				return
 			}
 
-			c.Log("Failed to read message: %v", err)
+			session.errors <- err
 			return
 		}
 
@@ -187,24 +244,58 @@ func (c *Client) Run() {
 		request := Request{}
 		err = decoder.Decode(&request)
 		if err != nil {
-			c.Log("Invalid message received: %v", err)
+			session.errors <- err
 			return
 		}
 
 		if decoder.More() {
-			c.Log("Incomplete parse")
+			session.errors <- errors.New("Incomplete parse")
 			return
 		}
 
-		err = c.processRequest(request)
-		if err != nil {
-			c.Log("Failed to process request: %v", err)
-			return
-		}
+		session.messages <- request
 	}
 }
 
-func (c *Client) Log(f string, args ...interface{}) {
+func (c *Session) Run() {
+	c.Log("New connection")
+	go c.readMessages()
+	for {
+		select {
+		case r := <-c.messages:
+			err := c.processRequest(r)
+			if err != nil {
+				c.Log("Request failed: %v", err)
+				// TODO: how to kill readMessages() goroutine?
+				return
+			}
+		case n := <-c.notifications:
+			err := c.sendResponse(n)
+			if err != nil {
+				c.Log("Failed to send notification: %v", err)
+				// TODO: how to kill readMessages() goroutine?
+				return
+			}
+		case err := <-c.errors:
+			if err != nil {
+				c.Log("Failed to read request: %v", err)
+			} else {
+				c.Log("Connection closed by user")
+			}
+			return
+		}
+	}
+
+}
+
+func (c *Session) Close() {
+	for id := range c.streams {
+		c.server.RemoveStream(id)
+	}
+	c.conn.Close()
+}
+
+func (c *Session) Log(f string, args ...interface{}) {
 	addr := c.conn.RemoteAddr()
 	if len(args) != 0 {
 		f = fmt.Sprintf(f, args...)
@@ -212,7 +303,7 @@ func (c *Client) Log(f string, args ...interface{}) {
 	log.Printf("[%v] %v", addr, f)
 }
 
-func (c *Client) sendFail(message string, args ...interface{}) error {
+func (c *Session) sendFail(message string, args ...interface{}) error {
 	if len(args) != 0 {
 		message = fmt.Sprintf(message, args...)
 	}
@@ -223,7 +314,7 @@ func (c *Client) sendFail(message string, args ...interface{}) error {
 	})
 }
 
-func (c *Client) sendResponse(response Response) error {
+func (c *Session) sendResponse(response Response) error {
 	data, err := json.Marshal(&response)
 	if err != nil {
 		log.Fatal(err)
@@ -232,7 +323,7 @@ func (c *Client) sendResponse(response Response) error {
 	return c.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
-func (c *Client) processRequest(request Request) error {
+func (c *Session) processRequest(request Request) error {
 	c.Log("Received \"%v\" request", request.Type)
 	switch request.Type {
 	case "get_streams":
@@ -251,11 +342,12 @@ func (c *Client) processRequest(request Request) error {
 			return c.sendFail("No stream provided for add_stream request")
 		}
 
-		id, err := c.server.AddStream(*request.Stream)
+		id, err := c.server.AddStream(*request.Stream, c.notifications)
 		if err != nil {
 			return c.sendFail("Failed to add stream: %v", err.Error())
 		}
 
+		c.streams[id] = struct{}{}
 		return c.sendResponse(Response{
 			Status:   "success",
 			StreamID: id,
@@ -268,6 +360,20 @@ func (c *Client) processRequest(request Request) error {
 		err := c.server.RemoveStream(request.StreamID)
 		if err != nil {
 			return c.sendFail("Failed to remove stream: %v", err.Error())
+		}
+		return c.sendResponse(Response{Status: "success"})
+	case "watch":
+		if request.StreamID == "" {
+			return c.sendFail("No stream id provided for watch request")
+		}
+
+		if request.Destination == "" {
+			return c.sendFail("No destination provided for watch request")
+		}
+
+		err := c.server.NotifyStreamer(request.StreamID, request.Destination)
+		if err != nil {
+			return c.sendFail("Failed to watch stream: %v", err.Error())
 		}
 		return c.sendResponse(Response{Status: "success"})
 	default:
@@ -290,12 +396,12 @@ func main() {
 		mongo = "mongodb://localhost:27017"
 	}
 
-	server, err := NewServer(addr, mongo)
+	server, err := NewServer("/streams", mongo)
 	if err != nil {
 		log.Fatal("Failed to create server instance:", err)
 	}
 
-	err = server.Run()
+	err = server.Run(addr)
 	if err != nil {
 		log.Fatal(err)
 	}
