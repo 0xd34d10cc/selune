@@ -150,7 +150,7 @@ func (server *Server) Run() error {
 	http.HandleFunc("/streams", func(rw http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(rw, r, nil)
 		if err != nil {
-			log.Println("Upgrade error: ", err)
+			log.Printf("[%v] Failed to upgrade to websocket: %v", r.RemoteAddr, err)
 			return
 		}
 		defer c.Close()
