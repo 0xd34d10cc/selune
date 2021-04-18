@@ -361,6 +361,8 @@ func (c *Session) processRequest(request Request) error {
 		if err != nil {
 			return c.sendFail("Failed to remove stream: %v", err.Error())
 		}
+
+		delete(c.streams, request.StreamID)
 		return c.sendResponse(Response{Status: "success"})
 	case "watch":
 		if request.StreamID == "" {
