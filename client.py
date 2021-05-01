@@ -52,6 +52,41 @@ async def test_remove(url=default_url):
         })
         await request(ws, {'type': 'get_streams'})
 
+
+@click.command()
+@coro
+async def test_no_token(url=default_url):
+    async with websockets.connect(url) as ws:
+        await request(ws, {'type': 'get_streams'})
+        response = await request(ws, {
+            'type': 'add_stream',
+            'stream': {
+                'address': 'rtp://127.0.0.1:1337',
+                'description': 'A stupid stream'
+            }
+        })
+        print(request)
+
+@click.command()
+@coro
+async def test_signup(url=default_url):
+    async with websockets.connect(url) as ws:
+        response = await request(ws, {
+            'type': 'sign_up',
+            'user': 'roman',
+            'password': '123'
+        })
+        print(response)
+        response = await request(ws, {
+            'type': 'login',
+            'user': 'roman',
+            'password': '123'
+        })
+        accessToken = response["access_token"]
+        await request(ws, {'type': 'get_streams',
+                           'access_token': accessToken})
+
+
 @click.command()
 @click.argument('stream_id')
 @click.argument('dst')
@@ -78,7 +113,9 @@ async def streamer(url=default_url):
         await recv(ws)
 
 if __name__ == '__main__':
-    cli.add_command(test_remove)
-    cli.add_command(streamer)
-    cli.add_command(viewer)
+    #cli.add_command(test_remove)
+    #cli.add_command(streamer)
+    #cli.add_command(viewer)
+    cli.add_command(test_no_token)
+    cli.add_command(test_signup)
     cli()

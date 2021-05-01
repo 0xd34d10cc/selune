@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"sync"
+	"time"
 
+	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
@@ -27,9 +30,33 @@ type Server struct {
 	mux      *http.ServeMux
 	dbClient *mongo.Client
 	streams  *mongo.Collection
+	users    *mongo.Collection
 
 	m         sync.Mutex
 	streamers map[StreamID]chan Response
+}
+
+// Auth info for each user
+type User struct {
+	ID        string    `json:"id" sql:"id"`
+	Username  string    `json:"username" sql:"username"`
+	TokenHash string    `json:"tokenhash" sql:"tokenhash"`
+	CreatedAt time.Time `json:"createdat" sql:"createdat"`
+	UpdatedAt time.Time `json:"updatedat" sql:"updatedat"`
+}
+
+// AccessTokenCustomClaims specifies the claims for access token
+type AccessTokenCustomClaims struct {
+	UserID  string
+	KeyType string
+	jwt.StandardClaims
+}
+
+type RefreshTokenCustomClaims struct {
+	UserID    string
+	CustomKey string
+	KeyType   string
+	jwt.StandardClaims
 }
 
 type Session struct {
@@ -52,6 +79,12 @@ type Request struct {
 	StreamID    StreamID `json:"stream_id,omitempty"`
 	Stream      *Stream  `json:"stream,omitempty"`
 	Destination string   `json:"destination,omitempty"`
+
+	// auth fields
+	User         string `json:"user,omitempty"`
+	Password     string `json:"password,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 type Response struct {
@@ -60,6 +93,10 @@ type Response struct {
 	StreamID    StreamID            `json:"stream_id,omitempty"`
 	Streams     map[StreamID]Stream `json:"streams,omitempty"`
 	Destination string              `json:"destination,omitempty"`
+
+	// auth fields
+	RefreshToken string `json:"refresh_token,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
 }
 
 func NewServer(path string, dbUri string) (*Server, error) {
@@ -75,12 +112,13 @@ func NewServer(path string, dbUri string) (*Server, error) {
 
 	log.Println("Successfully connected to", dbUri)
 	streams := dbClient.Database("selune").Collection("streams")
+	users := dbClient.Database("selune").Collection("users")
 
 	server := &Server{
-		mux:      nil,
-		dbClient: dbClient,
-		streams:  streams,
-
+		mux:       nil,
+		dbClient:  dbClient,
+		streams:   streams,
+		users:     users,
 		m:         sync.Mutex{},
 		streamers: make(map[StreamID]chan Response),
 	}
@@ -323,9 +361,272 @@ func (c *Session) sendResponse(response Response) error {
 	return c.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
+const TokenDuration = 1200
+const AccessTokenPrivateKeyPath = "access.pem"
+const AccessTokenPublicKeyPath = "access.pem.pub"
+const RefreshTokenPrivateKeyPath = "refresh.pem"
+const RefreshTokenPublicKeyPath = "refresh.pem.pub"
+
+func GenerateAccessToken(user *User) (string, error) {
+	claims := AccessTokenCustomClaims{
+		user.ID,
+		"access",
+		jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Minute * time.Duration(TokenDuration)).Unix(),
+			Issuer:    "bookite.auth.service",
+		},
+	}
+	signBytes, err := ioutil.ReadFile(AccessTokenPrivateKeyPath)
+	if err != nil {
+		log.Printf("unable to read private key", "error", err)
+		return "", errors.New("could not generate access token. please try again later")
+	}
+
+	signKey, err := jwt.ParseRSAPrivateKeyFromPEM(signBytes)
+	if err != nil {
+		log.Printf("unable to parse private key", "error", err)
+		return "", errors.New("could not generate access token. please try again later")
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+
+	return token.SignedString(signKey)
+}
+
+func ValidateAccessToken(tokenString string) (string, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &AccessTokenCustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			log.Printf("Unexpected signing method in auth token")
+			return nil, errors.New("Unexpected signing method in auth token")
+		}
+		verifyBytes, err := ioutil.ReadFile(AccessTokenPublicKeyPath)
+		if err != nil {
+			log.Printf("unable to read public key", "error", err)
+			return nil, err
+		}
+
+		verifyKey, err := jwt.ParseRSAPublicKeyFromPEM(verifyBytes)
+		if err != nil {
+			log.Printf("unable to parse public key", "error", err)
+			return nil, err
+		}
+
+		return verifyKey, nil
+	})
+
+	if err != nil {
+		log.Printf("unable to parse claims", "error", err)
+		return "", err
+	}
+
+	claims, ok := token.Claims.(*AccessTokenCustomClaims)
+	if !ok || !token.Valid || claims.UserID == "" || claims.KeyType != "access" {
+		return "", errors.New("invalid token: authentication failed")
+	}
+	return claims.UserID, nil
+}
+
+func GenerateRefreshToken(user *User) (string, error) {
+	// TODO: actually generate custom key from id and hash
+	cusKey := user.ID
+	tokenType := "refresh"
+
+	claims := RefreshTokenCustomClaims{
+		user.ID,
+		cusKey,
+		tokenType,
+		jwt.StandardClaims{
+			Issuer: "bookite.auth.service",
+		},
+	}
+
+	signBytes, err := ioutil.ReadFile(RefreshTokenPrivateKeyPath)
+	if err != nil {
+		log.Printf("unable to read private key", "error", err)
+		return "", errors.New("could not generate refresh token. please try again later")
+	}
+
+	signKey, err := jwt.ParseRSAPrivateKeyFromPEM(signBytes)
+	if err != nil {
+		log.Printf("unable to parse private key", "error", err)
+		return "", errors.New("could not generate refresh token. please try again later")
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+
+	return token.SignedString(signKey)
+}
+
+func ValidateRefreshToken(tokenString string) (string, string, error) {
+
+	token, err := jwt.ParseWithClaims(tokenString, &RefreshTokenCustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			log.Printf("Unexpected signing method in auth token")
+			return nil, errors.New("Unexpected signing method in auth token")
+		}
+		verifyBytes, err := ioutil.ReadFile(RefreshTokenPublicKeyPath)
+		if err != nil {
+			log.Printf("unable to read public key", "error", err)
+			return nil, err
+		}
+
+		verifyKey, err := jwt.ParseRSAPublicKeyFromPEM(verifyBytes)
+		if err != nil {
+			log.Printf("unable to parse public key", "error", err)
+			return nil, err
+		}
+
+		return verifyKey, nil
+	})
+
+	if err != nil {
+		log.Printf("unable to parse claims", "error", err)
+		return "", "", err
+	}
+
+	claims, ok := token.Claims.(*RefreshTokenCustomClaims)
+	if !ok || !token.Valid || claims.UserID == "" || claims.KeyType != "refresh" {
+		log.Printf("could not extract claims from token")
+		return "", "", errors.New("invalid token: authentication failed")
+	}
+	return claims.UserID, claims.CustomKey, nil
+}
+
+func (c *Session) processLogin(request *Request) error {
+	// TODO: use userID arg as userID
+
+	if request.User == "" || request.Password == "" {
+		return fmt.Errorf("login requested, but no password or username provided")
+	}
+
+	res := c.server.users.FindOne(context.Background(), bson.M{
+		"username": request.User,
+		"password": request.Password,
+	})
+
+	if res.Err() == mongo.ErrNilDocument {
+		return fmt.Errorf("no user with such username and password")
+	}
+
+	user := User{}
+	user.Username = request.User
+	user.ID = request.User
+	accessToken, err := GenerateAccessToken(&user)
+
+	if err != nil {
+		return err
+	}
+
+	refreshToken, err := GenerateRefreshToken(&user)
+
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Sucksexfully generated access token: %s and refresh token: %s for user: %s", accessToken, refreshToken, user.Username)
+
+	c.sendResponse(Response{
+		Status:       "success",
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+	})
+
+	return nil
+}
+
+func (c *Session) processSignUpRequest(request *Request) error {
+	if request.Password == "" || request.User == "" {
+		return fmt.Errorf("signup requested but no password or username provided")
+	}
+
+	// TODO: Hash password before signuping
+	// TODO: Use first arg as userID for token generation
+	_, err := c.server.users.InsertOne(context.Background(), bson.M{
+		"username": request.User,
+		"password": request.Password,
+	})
+
+	if err != nil {
+		return err
+	}
+
+	c.sendResponse(Response{
+		Status: "success",
+	})
+
+	return nil
+}
+
+func (c *Session) processRefreshToken(request *Request) error {
+	if request.RefreshToken == "" {
+		return fmt.Errorf("Refresh access token is requested, but no refresh token is provided")
+	}
+
+	// Since we are using no userid (same as username)  we do not need to check it and custom key
+	userId, _, err := ValidateRefreshToken(request.RefreshToken)
+	if err != nil {
+		return err
+	}
+
+	user := User{}
+	user.ID = userId
+
+	accessToken, err := GenerateAccessToken(&user)
+
+	if err != nil {
+		return err
+	}
+
+	c.sendResponse(Response{
+		Status:      "success",
+		AccessToken: accessToken,
+	})
+
+	return nil
+}
+
+func (c *Session) processTokenlessRequest(request *Request) error {
+	switch request.Type {
+	case "login":
+		err := c.processLogin(request)
+		if err != nil {
+			c.sendFail(err.Error())
+		}
+	case "sign_up":
+		err := c.processSignUpRequest(request)
+		if err != nil {
+			c.sendFail(err.Error())
+		}
+	case "refresh_token":
+		err := c.processRefreshToken(request)
+		if err != nil {
+			c.sendFail(err.Error())
+		}
+	default:
+		return fmt.Errorf("you need to log in before sending requests regarding streams")
+	}
+	return nil
+}
+
 func (c *Session) processRequest(request Request) error {
 	c.Log("Received \"%v\" request", request.Type)
+
+	// handle connections wthout tokens
+	if request.AccessToken == "" {
+		err := c.processTokenlessRequest(&request)
+		return err
+	}
+
+	// for now userId is same as username, so skip first param
+	// TODO: fix that we use username as userid
+	_, err := ValidateAccessToken(request.AccessToken)
+
+	if err != nil {
+		c.sendFail(err.Error())
+	}
+
 	switch request.Type {
+
 	case "get_streams":
 		streams, err := c.server.Streams()
 		if err != nil {
