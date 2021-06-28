@@ -4,7 +4,7 @@ import functools
 import websockets
 import click
 
-default_url = 'ws://localhost:8080/streams'
+default_url = 'ws://localhost:8088/streams'
 
 def coro(f):
     @functools.wraps(f)

@@ -55,11 +55,11 @@ type Request struct {
 }
 
 type Response struct {
-	Status      string              `json:"status"`
-	Message     string              `json:"message,omitempty"`
-	StreamID    StreamID            `json:"stream_id,omitempty"`
-	Streams     map[StreamID]Stream `json:"streams,omitempty"`
-	Destination string              `json:"destination,omitempty"`
+	Status      string               `json:"status"`
+	Message     string               `json:"message,omitempty"`
+	StreamID    StreamID             `json:"stream_id,omitempty"`
+	Streams     *map[StreamID]Stream `json:"streams,omitempty"`
+	Destination string               `json:"destination,omitempty"`
 }
 
 func NewServer(path string, dbUri string) (*Server, error) {
@@ -77,7 +77,7 @@ func NewServer(path string, dbUri string) (*Server, error) {
 	streams := dbClient.Database("selune").Collection("streams")
 
 	server := &Server{
-		mux:      nil,
+		mux:      http.NewServeMux(),
 		dbClient: dbClient,
 		streams:  streams,
 
@@ -85,9 +85,8 @@ func NewServer(path string, dbUri string) (*Server, error) {
 		streamers: make(map[StreamID]chan Response),
 	}
 
-	mux := http.NewServeMux()
 	upgrader := websocket.Upgrader{}
-	mux.HandleFunc(path, func(rw http.ResponseWriter, r *http.Request) {
+	server.mux.HandleFunc(path, func(rw http.ResponseWriter, r *http.Request) {
 		c, err := upgrader.Upgrade(rw, r, nil)
 		if err != nil {
 			log.Printf("[%v] Failed to upgrade to websocket: %v", r.RemoteAddr, err)
@@ -98,7 +97,6 @@ func NewServer(path string, dbUri string) (*Server, error) {
 		session.Run()
 	})
 
-	server.mux = mux
 	return server, nil
 }
 
@@ -285,7 +283,6 @@ func (c *Session) Run() {
 			return
 		}
 	}
-
 }
 
 func (c *Session) Close() {
@@ -335,7 +332,7 @@ func (c *Session) processRequest(request Request) error {
 
 		return c.sendResponse(Response{
 			Status:  "success",
-			Streams: streams,
+			Streams: &streams,
 		})
 	case "add_stream":
 		if request.Stream == nil {
