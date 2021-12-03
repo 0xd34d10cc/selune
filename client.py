@@ -4,13 +4,19 @@ import json
 import functools
 import websockets
 import click
+import itertools
 
 default_url = 'ws://localhost:8088/streams'
+
+STUN_MAGIC = b'\x21\x12\xa4\x42'
+
+def stun_xor(data):
+    return bytes(b ^ m for b, m in zip(data, itertools.cycle(STUN_MAGIC)))
 
 def bind_request():
     type = b'\x00\x01' # bind request
     body_len = b'\x00\x00'
-    cookie = b'\x21\x12\xa4\x42'
+    cookie = STUN_MAGIC
     request_id = b'\x01' * 12 # should be random, but whatever
     return type + body_len + cookie + request_id
 
@@ -20,31 +26,27 @@ def parse_stun_response(response):
     while attributes:
         type = int.from_bytes(attributes[:2], 'big')
         attr_len = int.from_bytes(attributes[2:4], 'big')
-        if type not in (0x01, 0x20):
-            attributes = attributes[4 + attr_len:]
-            continue
-
         data = attributes[4:]
-        # MAPPED-ADDRESS
-        if type == 0x01:
+
+        def get_addr(pre=lambda x: x):
             family = data[1]
+            # if not IPv4, continue
             if family != 0x01 or attr_len != 8:
-                attributes = attributes[4 + attr_len:]
-                continue
-            port = int.from_bytes(data[2:4], 'big')
-            ip = '.'.join(str(octet) for octet in data[4:8])
+                return None
+            port = int.from_bytes(pre(data[2:4]), 'big')
+            ip = '.'.join(str(octet) for octet in pre(data[4:8]))
             return f'{ip}:{port}'
 
-        if type == 0x20:
-            family = data[1]
-            if family != 0x01 or attr_len != 8:
-                attributes = attributes[4 + attr_len:]
-                continue
-            port = int.from_bytes(bytes([data[2] ^ 0x21, data[3] ^ 0x12]), 'big')
-            ip = '.'.join(str(octet ^ magic) for octet, magic in zip(data[4:8], b'\x21\x12\xa4\x42'))
-            return f'{ip}:{port}'
-
-        assert False
+        if type == 0x01: # MAPPED-ADDRESS
+            addr = get_addr()
+            if addr:
+                return addr
+        elif type == 0x20: # XOR-MAPPED-ADDRESS
+            addr = get_addr(pre=stun_xor)
+            if addr:
+                return addr
+        else:
+            attributes = attributes[4 + attr_len:]
 
     return None
 
@@ -84,10 +86,6 @@ async def request(ws, request):
     await send(ws, request)
     return await recv(ws)
 
-@click.group()
-def cli():
-    pass
-
 @click.command()
 @coro
 async def test_remove(url=default_url):
@@ -114,6 +112,7 @@ async def test_remove(url=default_url):
 async def viewer(url=default_url):
     s, external_addr = public_socket('0.0.0.0', 3030)
     async with websockets.connect(url) as ws:
+        # Wait for a stream
         response = {'streams': {}}
         print('Waiting for stream')
         while True:
@@ -126,6 +125,7 @@ async def viewer(url=default_url):
             await asyncio.sleep(3)
             print('-----------------------')
 
+        # Send watch request
         stream_id, stream_description = list(response['streams'].items())[0]
         streamer_addr = stream_description['address']
         print(f'viewing {stream_id} at {streamer_addr}')
@@ -137,7 +137,7 @@ async def viewer(url=default_url):
 
         assert response['status'] == 'success'
 
-        # start punching a hole
+        # Start sending messages
         s.settimeout(0)
         streamer_ip, streamer_port = streamer_addr[6:].split(':')
         print('streamer at: ', streamer_ip, streamer_port)
@@ -150,7 +150,7 @@ async def viewer(url=default_url):
                     data, sender = s.recvfrom(1024)
                     print(f'{sender} says: {data.decode()}')
                 except ConnectionResetError:
-                    pass
+                    print(f'{streamer_ip}:{streamer_port} is unreachable')
                 except BlockingIOError:
                     retry = False
             await asyncio.sleep(1)
@@ -163,6 +163,7 @@ async def streamer(url=default_url):
     s, external_addr = public_socket('0.0.0.0', 3031)
 
     async with websockets.connect(url) as ws:
+        # Register stream
         await request(ws, {
             'type': 'add_stream',
             'stream': {
@@ -171,10 +172,12 @@ async def streamer(url=default_url):
             }
         })
 
+        # Wait for a viewer
         notification = await recv(ws)
         assert notification['status'] == 'new_viewer'
         viewer_addr = notification['destination']
 
+        # Start sending messages
         s.settimeout(0)
         viewer_ip, viewer_port = viewer_addr[6:].split(':')
         print('viewer at: ', viewer_ip, viewer_port)
@@ -187,12 +190,14 @@ async def streamer(url=default_url):
                     data, sender = s.recvfrom(1024)
                     print(f'{sender} says: {data.decode()}')
                 except ConnectionResetError:
-                    pass
+                    print(f'{viewer_ip}:{viewer_port} is unreachable')
                 except BlockingIOError:
                     retry = False
             await asyncio.sleep(1)
 
-
+@click.group()
+def cli():
+    pass
 
 if __name__ == '__main__':
     cli.add_command(test_remove)
