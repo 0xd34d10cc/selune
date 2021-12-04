@@ -45,8 +45,8 @@ def parse_stun_response(response):
             addr = get_addr(pre=stun_xor)
             if addr:
                 return addr
-        else:
-            attributes = attributes[4 + attr_len:]
+
+        attributes = attributes[4 + attr_len:]
 
     return None
 
@@ -63,7 +63,6 @@ def public_socket(host, port):
     assert sender[0] == stun_server
     external_addr = parse_stun_response(response)
     return s, external_addr
-
 
 def coro(f):
     @functools.wraps(f)
@@ -85,6 +84,20 @@ async def recv(ws):
 async def request(ws, request):
     await send(ws, request)
     return await recv(ws)
+
+def print_messages(s):
+    while True:
+        data, sender = s.recvfrom(1024)
+        print(f'{sender} says: {data.decode()}')
+
+async def spam_messages(s, message, host, port):
+    import threading
+    t = threading.Thread(target=lambda: print_messages(s))
+    t.setDaemon(True)
+    t.start()
+    while True:
+        s.sendto(message, (host, int(port)))
+        await asyncio.sleep(1)
 
 @click.command()
 @coro
@@ -138,24 +151,9 @@ async def viewer(url=default_url):
         assert response['status'] == 'success'
 
         # Start sending messages
-        s.settimeout(0)
         streamer_ip, streamer_port = streamer_addr[6:].split(':')
         print('streamer at: ', streamer_ip, streamer_port)
-        while True:
-            s.sendto(b'Hello from viewer', (streamer_ip, int(streamer_port)))
-
-            retry = True
-            while retry:
-                try:
-                    data, sender = s.recvfrom(1024)
-                    print(f'{sender} says: {data.decode()}')
-                except ConnectionResetError:
-                    print(f'{streamer_ip}:{streamer_port} is unreachable')
-                except BlockingIOError:
-                    retry = False
-            await asyncio.sleep(1)
-
-
+        await spam_messages(s, b'Hello from viewer', streamer_ip, streamer_port)
 
 @click.command()
 @coro
@@ -178,22 +176,9 @@ async def streamer(url=default_url):
         viewer_addr = notification['destination']
 
         # Start sending messages
-        s.settimeout(0)
         viewer_ip, viewer_port = viewer_addr[6:].split(':')
         print('viewer at: ', viewer_ip, viewer_port)
-        while True:
-            s.sendto(b'Hello from streamer', (viewer_ip, int(viewer_port)))
-
-            retry = True
-            while retry:
-                try:
-                    data, sender = s.recvfrom(1024)
-                    print(f'{sender} says: {data.decode()}')
-                except ConnectionResetError:
-                    print(f'{viewer_ip}:{viewer_port} is unreachable')
-                except BlockingIOError:
-                    retry = False
-            await asyncio.sleep(1)
+        await spam_messages(s, b'Hello from streamer', viewer_ip, viewer_port)
 
 @click.group()
 def cli():
