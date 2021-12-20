@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package selune;
+
+option go_package = "./pb";
+
+service Selune {
+    // Share connection info with the server and listen for incoming connections
+    rpc Listen(Connection) returns (stream NewConnection);
+
+    // Request a connection to Connection
+    rpc Connect(Connection) returns (Status);
+
+    // Request list of connections shared with the server
+    rpc AvailableConnections(ConnectionListRequest) returns (stream ConnectionList);
+}
+
+message Connection {
+    // User id, should be empty in Listen() request, it is assigned by server
+    int32 id = 1;
+
+    // Name of the user
+    string username = 2;
+
+    // User address. Opaque to the service, so it won't be validated in any way
+    bytes address = 3;
+}
+
+message NewConnection {
+    // Error, if any
+    Status status = 1;
+
+    // ID of your connection, sent only once
+    int32 id = 2;
+
+    // Connection information about initiator of connection
+    // (could be used for UDP hole punching, for example)
+    Connection initiator = 3;
+}
+
+message ConnectionListRequest {}
+
+message ConnectionList {
+    repeated Connection connections = 1;
+}
+
+message Status {
+    // Description of error. Absent if request was successful
+    string description = 1;
+}
