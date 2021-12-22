@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package selune;
+
+option go_package = "./proto";
+
+service Selune {
+    // Share connection info with the server and listen for incoming connections
+    // Note: your status is automatically changed to offline when response stream is terminated
+    rpc GoOnline(User) returns (stream NewConnection);
+
+    // Request a connection to user
+    rpc Connect(ConnectionRequest) returns (Status);
+
+    // Request list online users connected to the server
+    rpc ListOnlineUsers(UserListRequest) returns (UserList);
+}
+
+message User {
+    // User id, should be empty in GoOnline() request, it is assigned by server
+    uint32 id = 1;
+
+    // Name of the user
+    string username = 2;
+
+    // User address. Opaque to the server.
+    bytes address = 3;
+}
+
+message NewConnection {
+    // Error, if any
+    Status status = 1;
+
+    // ID of your connection, sent only once
+    uint32 id = 2;
+
+    // Connection information about initiator of connection
+    // (could be used for UDP hole punching, for example)
+    User initiator = 4;
+}
+
+message ConnectionRequest {
+    // ID of your connection
+    uint32 initiator_id = 1;
+
+    // ID of the User that you want to connect to
+    uint32 target_id = 2;
+}
+
+message UserListRequest {}
+
+message UserList {
+    // List of online users on the server
+    repeated User users = 1;
+}
+
+message Status {
+    // Description of error. Empty on success.
+    string description = 1;
+}
